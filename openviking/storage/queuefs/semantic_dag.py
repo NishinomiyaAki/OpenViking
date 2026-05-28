@@ -4,7 +4,7 @@
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from openviking.server.identity import RequestContext
 from openviking.storage.queuefs.semantic_sidecar import write_semantic_sidecars
@@ -83,6 +83,8 @@ class SemanticDagExecutor:
         lock: LockLease = NO_LOCK,
         is_code_repo: bool = False,
         changes: Optional[Dict[str, List[str]]] = None,
+        change_details: Optional[Dict[str, List[str]]] = None,
+        selective_incremental: bool = False,
         skip_vectorization: bool = False,
         coalesce_key: str = "",
         coalesce_version: int = 0,
@@ -99,6 +101,10 @@ class SemanticDagExecutor:
         self._lock = lock
         self._is_code_repo = is_code_repo
         self._changes = changes or {}
+        self._change_details = change_details or {}
+        self._selective_incremental = (
+            selective_incremental and incremental_update and bool(self._changes)
+        )
         self._skip_vectorization = skip_vectorization
         self._coalesce_key = coalesce_key
         self._coalesce_version = coalesce_version
@@ -106,6 +112,13 @@ class SemanticDagExecutor:
         self._changed_paths = {
             path for key in ("added", "modified", "deleted") for path in self._changes.get(key, [])
         }
+        self._added_file_paths: Set[str] = set(self._change_details.get("added_files", []))
+        self._modified_file_paths: Set[str] = set(self._change_details.get("updated_files", []))
+        self._deleted_file_paths: Set[str] = set(self._change_details.get("deleted_files", []))
+        self._added_dir_paths: Set[str] = set(self._change_details.get("added_dirs", []))
+        self._deleted_dir_paths: Set[str] = set(self._change_details.get("deleted_dirs", []))
+        self._impacted_dirs: Set[str] = set()
+        self._forced_recursive_dir_roots: Set[str] = set()
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm)
         self._viking_fs = get_viking_fs()
         self._nodes: Dict[str, DirNode] = {}
@@ -125,6 +138,8 @@ class SemanticDagExecutor:
         """Run DAG execution starting from root_uri."""
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
+        if self._is_selective_incremental_update():
+            self._initialize_selective_plan()
 
         try:
             await self._dispatch_dir(root_uri, parent_uri=None)
@@ -200,10 +215,22 @@ class SemanticDagExecutor:
             children_dirs, file_paths = await self._list_dir(dir_uri, "_dispatch_dir")
             file_index = {path: idx for idx, path in enumerate(file_paths)}
             child_index = {path: idx for idx, path in enumerate(children_dirs)}
+            files_to_schedule = file_paths
+            children_to_dispatch = children_dirs if self._recursive else []
+            if self._is_selective_incremental_update():
+                files_to_schedule = [
+                    file_path for file_path in file_paths if self._should_schedule_file_task(file_path)
+                ]
+                if self._recursive:
+                    children_to_dispatch = [
+                        child_uri
+                        for child_uri in children_dirs
+                        if self._should_dispatch_child_dir(child_uri)
+                    ]
             if self._recursive:
-                pending = len(children_dirs) + len(file_paths)
+                pending = len(children_to_dispatch) + len(files_to_schedule)
             else:
-                pending = len(file_paths)
+                pending = len(files_to_schedule)
 
             node = DirNode(
                 uri=dir_uri,
@@ -224,7 +251,7 @@ class SemanticDagExecutor:
                 self._schedule_overview(dir_uri)
                 return
 
-            for file_path in file_paths:
+            for file_path in files_to_schedule:
                 self._stats.total_nodes += 1
                 # File nodes are scheduled immediately: pending -> in_progress.
                 self._stats.pending_nodes += 1
@@ -232,10 +259,9 @@ class SemanticDagExecutor:
                 self._stats.in_progress_nodes += 1
                 asyncio.create_task(self._file_summary_task(dir_uri, file_path))
 
-            if children_dirs:
-                if self._recursive:
-                    for child_uri in children_dirs:
-                        asyncio.create_task(self._dispatch_dir(child_uri, dir_uri))
+            if children_to_dispatch:
+                for child_uri in children_to_dispatch:
+                    asyncio.create_task(self._dispatch_dir(child_uri, dir_uri))
         except Exception as e:
             logger.error(f"Failed to dispatch directory {dir_uri}: {e}", exc_info=True)
             if parent_uri:
@@ -269,6 +295,88 @@ class SemanticDagExecutor:
 
         return children_dirs, file_paths
 
+    @staticmethod
+    def _path_is_under(path: str, ancestor: str) -> bool:
+        normalized_path = path.rstrip("/")
+        normalized_ancestor = ancestor.rstrip("/")
+        return normalized_path == normalized_ancestor or normalized_path.startswith(
+            normalized_ancestor + "/"
+        )
+
+    def _is_selective_incremental_update(self) -> bool:
+        return self._selective_incremental and bool(self._root_uri)
+
+    def _collect_ancestor_dirs(self, uri: str, *, include_self: bool) -> Set[str]:
+        dirs: Set[str] = set()
+        root_uri = (self._root_uri or "").rstrip("/")
+        if not root_uri:
+            return dirs
+
+        if include_self:
+            current = uri.rstrip("/")
+        else:
+            parent = VikingURI(uri).parent
+            current = parent.uri.rstrip("/") if parent is not None else ""
+
+        while current:
+            if current != root_uri and not self._path_is_under(current, root_uri):
+                break
+            dirs.add(current)
+            if current == root_uri:
+                break
+            parent = VikingURI(current).parent
+            if parent is None:
+                break
+            next_uri = parent.uri.rstrip("/")
+            if not next_uri or next_uri in {"viking://", "viking:"} or next_uri == current:
+                break
+            current = next_uri
+
+        return dirs
+
+    def _reduce_dir_roots(self, dirs: Set[str]) -> Set[str]:
+        reduced: Set[str] = set()
+        for dir_uri in sorted({uri.rstrip("/") for uri in dirs if uri}, key=len):
+            if any(self._path_is_under(dir_uri, existing) for existing in reduced):
+                continue
+            reduced.add(dir_uri)
+        return reduced
+
+    def _initialize_selective_plan(self) -> None:
+        root_uri = (self._root_uri or "").rstrip("/")
+        if not root_uri:
+            return
+
+        impacted_dirs: Set[str] = {root_uri}
+        for file_uri in (
+            self._added_file_paths | self._modified_file_paths | self._deleted_file_paths
+        ):
+            impacted_dirs.update(self._collect_ancestor_dirs(file_uri, include_self=False))
+        for dir_uri in self._added_dir_paths:
+            impacted_dirs.update(self._collect_ancestor_dirs(dir_uri, include_self=True))
+        for dir_uri in self._deleted_dir_paths:
+            impacted_dirs.update(self._collect_ancestor_dirs(dir_uri, include_self=False))
+
+        self._impacted_dirs = impacted_dirs
+        self._forced_recursive_dir_roots = self._reduce_dir_roots(self._added_dir_paths)
+
+    def _is_within_forced_recursive_dir(self, uri: str) -> bool:
+        return any(
+            self._path_is_under(uri, root_uri) for root_uri in self._forced_recursive_dir_roots
+        )
+
+    def _should_dispatch_child_dir(self, child_uri: str) -> bool:
+        if not self._recursive:
+            return False
+        if not self._is_selective_incremental_update():
+            return True
+        return child_uri in self._impacted_dirs or self._is_within_forced_recursive_dir(child_uri)
+
+    def _should_schedule_file_task(self, file_path: str) -> bool:
+        if not self._is_selective_incremental_update():
+            return True
+        return file_path in self._changed_paths or self._is_within_forced_recursive_dir(file_path)
+
     def _get_target_file_path(self, current_uri: str) -> Optional[str]:
         if not self._incremental_update or not self._target_uri or not self._root_uri:
             logger.warning(
@@ -293,11 +401,15 @@ class SemanticDagExecutor:
     def _path_has_direct_change(self, uri: str) -> bool:
         if uri in self._changed_paths:
             return True
+        if self._is_selective_incremental_update() and self._is_within_forced_recursive_dir(uri):
+            return True
         prefix = uri.rstrip("/") + "/"
         return any(path.startswith(prefix) for path in self._changed_paths)
 
     async def _check_file_content_changed(self, file_path: str) -> bool:
         if self._is_direct_incremental_update():
+            if self._is_selective_incremental_update():
+                return self._should_schedule_file_task(file_path)
             return file_path in self._changed_paths
         target_path = self._get_target_file_path(file_path)
         if not target_path:
@@ -518,14 +630,15 @@ class SemanticDagExecutor:
         self._stats.in_progress_nodes += 1
         asyncio.create_task(self._overview_task(dir_uri))
 
-    def _finalize_file_summaries(self, node: DirNode) -> List[Dict[str, str]]:
+    async def _finalize_file_summaries(self, node: DirNode) -> List[Dict[str, str]]:
         summaries: List[Dict[str, str]] = []
         for idx, file_path in enumerate(node.file_paths):
             item = node.file_summaries[idx]
             if item is None:
-                summaries.append({"name": file_path.split("/")[-1], "summary": ""})
-            else:
-                summaries.append(item)
+                item = await self._read_existing_summary(file_path)
+            if item is None:
+                item = {"name": file_path.split("/")[-1], "summary": ""}
+            summaries.append(item)
         return summaries
 
     @property
@@ -591,7 +704,7 @@ class SemanticDagExecutor:
                     overview, abstract = await self._read_existing_overview_abstract(dir_uri)
             if overview is None or abstract is None:
                 async with node.lock:
-                    file_summaries = self._finalize_file_summaries(node)
+                    file_summaries = await self._finalize_file_summaries(node)
                     children_abstracts = await self._finalize_children_abstracts(node)
                 async with self._llm_sem:
                     overview = await self._processor._generate_overview(

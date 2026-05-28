@@ -70,6 +70,26 @@ class DiffResult:
             "deleted": self.deleted_files + self.deleted_dirs,
         }
 
+    def to_detail_map(self) -> Dict[str, List[str]]:
+        return {
+            "added_files": list(self.added_files),
+            "deleted_files": list(self.deleted_files),
+            "updated_files": list(self.updated_files),
+            "added_dirs": list(self.added_dirs),
+            "deleted_dirs": list(self.deleted_dirs),
+        }
+
+    def has_changes(self) -> bool:
+        return any(
+            (
+                self.added_files,
+                self.deleted_files,
+                self.updated_files,
+                self.added_dirs,
+                self.deleted_dirs,
+            )
+        )
+
 
 class RequestQueueStats:
     processed: int = 0
@@ -378,9 +398,12 @@ class SemanticProcessor(DequeueHandlerBase):
                             )
                         else:
                             is_incremental = False
+                            selective_incremental = False
                             target_uri = msg.target_uri
                             run_uri = msg.uri
                             changes = msg.changes
+                            change_details: Optional[Dict[str, List[str]]] = None
+                            skip_dag = False
                             viking_fs = get_viking_fs()
                             if msg.target_uri:
                                 target_exists = await viking_fs.exists(
@@ -405,10 +428,29 @@ class SemanticProcessor(DequeueHandlerBase):
                                         f"added_dirs={len(diff.added_dirs)}, "
                                         f"deleted_dirs={len(diff.deleted_dirs)}"
                                     )
+                                    selective_incremental = bool(msg.target_preexisting)
+                                    change_details = diff.to_detail_map()
                                     changes = diff.to_changes()
                                     is_incremental = True
                                     target_uri = msg.target_uri
                                     run_uri = msg.target_uri
+                                    if selective_incremental and not diff.has_changes():
+                                        skip_dag = True
+                                        self._cache_dag_stats(
+                                            msg.telemetry_id,
+                                            run_uri,
+                                            DagStats(),
+                                        )
+                                        if msg.telemetry_id and msg.id:
+                                            get_request_wait_tracker().mark_semantic_done(
+                                                msg.telemetry_id,
+                                                msg.id,
+                                                processed_delta=0,
+                                            )
+                                        logger.info(
+                                            "Skipping semantic DAG for unchanged existing target: %s",
+                                            run_uri,
+                                        )
                                 elif target_exists and msg.changes and msg.uri == msg.target_uri:
                                     is_incremental = True
                                     logger.info(
@@ -421,33 +463,37 @@ class SemanticProcessor(DequeueHandlerBase):
                                     f"Using direct incremental semantic update for: {msg.uri}"
                                 )
 
-                            executor = SemanticDagExecutor(
-                                processor=self,
-                                context_type=msg.context_type,
-                                max_concurrent_llm=self.max_concurrent_llm,
-                                ctx=self._current_ctx,
-                                incremental_update=is_incremental,
-                                target_uri=target_uri,
-                                semantic_msg_id=msg.id,
-                                telemetry_id=msg.telemetry_id,
-                                recursive=msg.recursive,
-                                lock=semantic_lock.lock,
-                                is_code_repo=msg.is_code_repo,
-                                changes=changes,
-                                skip_vectorization=msg.skip_vectorization,
-                                coalesce_key=msg.coalesce_key,
-                                coalesce_version=msg.coalesce_version,
-                            )
-                            self._dag_executor = executor
-                            lock_transferred = True
-                            await executor.run(run_uri)
-                            self._cache_dag_stats(
-                                msg.telemetry_id,
-                                run_uri,
-                                executor.get_stats(),
-                            )
-                            if not executor.stale:
-                                await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
+                            self._dag_executor = None
+                            if not skip_dag:
+                                executor = SemanticDagExecutor(
+                                    processor=self,
+                                    context_type=msg.context_type,
+                                    max_concurrent_llm=self.max_concurrent_llm,
+                                    ctx=self._current_ctx,
+                                    incremental_update=is_incremental,
+                                    target_uri=target_uri,
+                                    semantic_msg_id=msg.id,
+                                    telemetry_id=msg.telemetry_id,
+                                    recursive=msg.recursive,
+                                    lock=semantic_lock.lock,
+                                    is_code_repo=msg.is_code_repo,
+                                    changes=changes,
+                                    change_details=change_details,
+                                    selective_incremental=selective_incremental,
+                                    skip_vectorization=msg.skip_vectorization,
+                                    coalesce_key=msg.coalesce_key,
+                                    coalesce_version=msg.coalesce_version,
+                                )
+                                self._dag_executor = executor
+                                lock_transferred = True
+                                await executor.run(run_uri)
+                                self._cache_dag_stats(
+                                    msg.telemetry_id,
+                                    run_uri,
+                                    executor.get_stats(),
+                                )
+                                if not executor.stale:
+                                    await self._enqueue_parent_refresh(msg, target_uri or msg.uri)
                     finally:
                         if not lock_transferred:
                             await semantic_lock.close()
